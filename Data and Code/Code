@@ -1,0 +1,519 @@
+# =======================
+# 1. INITIAL SETUP
+# =======================
+rm(list = ls())
+setwd("/Users/")
+
+# Load/install packages
+packages <- c(
+  "readxl", "tidyr", "dplyr", "plm", "ggplot2", "readr", "corrplot",
+  "flextable", "officer", "modelsummary", "tibble", "stringi",
+  "sf", "rnaturalearth", "rnaturalearthdata"
+)
+
+invisible(lapply(packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}))
+
+# =======================
+# 2. LOAD AND CLEAN DATA
+# =======================
+read_data <- function(file, na = c("..", "...", "n/a")) {
+  if (grepl("\\.xlsx$", file)) readxl::read_excel(file, na = na) else read.csv(file, na.strings = na)
+}
+
+OECD_MPI <- read_data("OECD_MPI.csv")
+WDI <- read_data("WDI.csv")
+wgidataset <- read_data("wgidataset.csv")
+
+# Rename columns
+rename_cols <- function(df, map) {
+  names(df)[match(names(map), names(df))] <- map
+  df
+}
+OECD_MPI <- rename_cols(OECD_MPI, c("RECIPIENT" = "CountryCode", "Recipient" = "Country", 
+                                    "TIME_PERIOD" = "Year", "OBS_VALUE" = "MPI"))
+
+# Convert MPI from millions to absolute USD
+OECD_MPI$MPI <- OECD_MPI$MPI * 1e6
+
+WDI <- rename_cols(WDI, c("Country.Code" = "CountryCode", "Country.Name" = "Country", "Time" = "Year"))
+wgidataset <- rename_cols(wgidataset, c("code" = "CountryCode", "countryname" = "Country", "year" = "Year"))
+
+# WGI to wide format
+wgi_selected <- wgidataset %>%
+  select(CountryCode, Year, indicator, estimate) %>%
+  pivot_wider(names_from = indicator, values_from = estimate) %>%
+  rename(Corruption = cc, GovEff = ge, Stability = pv, RuleOfLaw = rl, RegQuality = rq, Voice = va)
+
+# Match data types
+for (df in list(OECD_MPI, WDI, wgi_selected)) {
+  df$Year <- as.numeric(df$Year)
+  df$CountryCode <- as.character(df$CountryCode)
+}
+
+# Merge datasets
+merged <- OECD_MPI %>%
+  left_join(WDI, by = c("CountryCode", "Year")) %>%
+  left_join(wgi_selected, by = c("CountryCode", "Year"))
+
+# Adjust MPI using CPI
+merged <- merged %>%
+  mutate(Infl = as.numeric(`Inflation..consumer.prices..annual.....FP.CPI.TOTL.ZG.`)) %>%
+  group_by(CountryCode) %>%
+  arrange(Year) %>%
+  mutate(CPI_index = cumprod(1 + (Infl / 100)),
+         CPI_2015 = CPI_index[Year == 2015][1],
+         MPI_Real = MPI / (CPI_index / CPI_2015)) %>%
+  ungroup() %>%
+  select(-Infl)
+
+# =======================
+# 3. VARIABLE CREATION
+# =======================
+
+merged_clean <- merged %>%
+  rename(
+    GDP_PC = `GDP.per.capita..constant.2015.US....NY.GDP.PCAP.KD.`,
+    GDP_Const2015 = `GDP..constant.2015.US....NY.GDP.MKTP.KD.`,
+    Population = `Population..total..SP.POP.TOTL.`,
+    Infl = `Inflation..consumer.prices..annual.....FP.CPI.TOTL.ZG.`,
+    Trade_GDP = `Trade....of.GDP...NE.TRD.GNFS.ZS.`,
+    Debt_GNI = `External.debt.stocks....of.GNI...DT.DOD.DECT.GN.ZS.`,
+    Bank_Borrowers = `Borrowers.from.commercial.banks..per.1.000.adults...FB.CBK.BRWR.P3.`,
+    FDI_GDP = `Foreign.direct.investment..net.inflows....of.GDP...BX.KLT.DINV.WD.GD.ZS.`
+  ) %>%
+  mutate(
+    across(c(GDP_PC, GDP_Const2015, Population, FDI_GDP, Infl, Trade_GDP), ~ suppressWarnings(as.numeric(.))),
+    
+    FDI_Total = ifelse(!is.na(FDI_GDP) & !is.na(GDP_Const2015) & FDI_GDP >= 0 & GDP_Const2015 >= 0,
+                       (FDI_GDP / 100) * GDP_Const2015, NA_real_),
+    
+    Log_FDI_Total = ifelse(!is.na(FDI_Total) & FDI_Total > 0, log(FDI_Total + 1), NA_real_),
+    
+    Log_MPI = ifelse(!is.na(MPI_Real) & MPI_Real > 0, log(MPI_Real + 1), NA_real_),
+    Log_GDP_PC = ifelse(!is.na(GDP_PC) & GDP_PC > 0, log(GDP_PC + 1), NA_real_),
+    Log_GDP_Const2015 = ifelse(!is.na(GDP_Const2015) & GDP_Const2015 > 0, log(GDP_Const2015 + 1), NA_real_),
+    Log_Population = ifelse(!is.na(Population) & Population > 0, log(Population + 1), NA_real_),
+    
+    Post_Covid = ifelse(!is.na(Year) & Year >= 2020, 1, 0)
+  )
+
+
+# =======================
+# 4. PCA ON GOVERNANCE INDICATORS
+# =======================
+gov_data <- merged_clean %>%
+  select(Corruption, GovEff, Stability, RuleOfLaw, RegQuality, Voice) %>%
+  na.omit()
+
+pca_scores <- predict(prcomp(scale(gov_data), center = TRUE, scale. = TRUE)) %>% as.data.frame()
+merged_clean$Gov_PCA1 <- NA
+merged_clean[rownames(pca_scores), "Gov_PCA1"] <- pca_scores$PC1
+
+# =======================
+# 5. DESCRIPTIVE STATISTICS
+# =======================
+
+# Select relevant variables
+desc_data <- merged_clean %>%
+  select(GDP_Const2015, GovEff, Infl, Log_GDP_Const2015, Log_MPI,
+         Log_Population, MPI_Real, RegQuality, RuleOfLaw, Trade_GDP)
+
+# Compute statistics
+desc_stats_fixed <- data.frame(
+  Variable = names(desc_data),
+  N = sapply(desc_data, function(x) sum(!is.na(x))),
+  Mean = sapply(desc_data, function(x) mean(x, na.rm = TRUE)),
+  Median = sapply(desc_data, function(x) median(x, na.rm = TRUE)),
+  SD = sapply(desc_data, function(x) sd(x, na.rm = TRUE)),
+  Min = sapply(desc_data, function(x) min(x, na.rm = TRUE)),
+  Max = sapply(desc_data, function(x) max(x, na.rm = TRUE))
+)
+
+# Format numbers: 2 decimals, scientific if large/small, remove + signs
+desc_stats_fixed <- desc_stats_fixed %>%
+  mutate(across(c(Mean, Median, SD, Min, Max), ~ ifelse(
+    abs(.) > 1e6 | (abs(.) < 0.01 & . != 0),
+    sub("e\\+?", "e", formatC(., format = "e", digits = 2)),  
+    formatC(., format = "f", digits = 2)
+  )))
+
+
+# Convert to flextable
+desc_table_final <- flextable(desc_stats_fixed) %>%
+  autofit() %>%
+  set_caption("Table 2. Descriptive Statistics for Key Variables")
+
+# Export to Word file
+read_docx() %>%
+  body_add_flextable(desc_table_final) %>%
+  print(target = "Table2_Descriptive_Statistics.docx")
+
+
+# =======================
+# 6. FIGURE 1 – MPI BY YEAR
+# =======================
+
+merged_clean %>%
+  filter(!is.na(GovEff), !is.na(Log_MPI), is.finite(Log_MPI)) %>%
+  ggplot(aes(x = GovEff, y = Log_MPI)) +
+  geom_point(alpha = 0.6, color = "royalblue") +
+  geom_smooth(method = "lm", color = "darkred", se = FALSE) +
+  labs(
+    title = "Figure 2. Government Effectiveness vs Log(MPI)",
+    x = "Government Effectiveness (WGI)",
+    y = "Log(MPI, 2015 USD)"
+  ) +
+  theme_minimal()
+
+ggsave("Figure2_GovEff_vs_LogMPI.png", width = 7, height = 5, dpi = 300)
+
+# =======================
+# 7. FIGURE 2 – SCATTERPLOT: GOV EFFECTIVENESS vs LOG(MPI)
+# =======================
+ggplot(merged_clean, aes(x = GovEff, y = Log_MPI)) +
+  geom_point(alpha = 0.6, color = "royalblue") +
+  geom_smooth(method = "lm", color = "darkred", se = FALSE) +
+  labs(title = "Figure 2. Government Effectiveness vs Log(MPI)",
+       x = "Government Effectiveness", y = "Log(MPI)") +
+  theme_minimal()
+
+ggsave("Figure2_GovEff_vs_LogMPI.png", width = 7, height = 5, dpi = 300)
+
+
+# =======================
+# 8. TABLE 3 – CORRELATION MATRIX (FIGURE + TABLE)
+# =======================
+
+# Step 1: Select relevant numeric variables
+cor_data <- merged_clean %>%
+  select(Log_MPI, Log_GDP_Const2015, Infl, Trade_GDP, 
+         RuleOfLaw, GovEff, RegQuality, Log_Population) %>%
+  na.omit()
+
+# Step 2: Compute correlation matrix and round
+cor_matrix <- round(cor(cor_data), 2)
+
+# Step 3: Save as heatmap figure (PNG)
+png("Figure3_Correlation_Heatmap.png", width = 800, height = 600)
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.col = "black", tl.cex = 0.9, number.cex = 0.8,
+         title = "Figure 3. Correlation Matrix of Key Variables", mar = c(0,0,1,0))
+dev.off()
+
+# Step 4: Convert correlation matrix to clean data frame for Word table
+cor_df <- cor_matrix %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Variable")
+
+# Format all numeric cells for clean Word export
+cor_df[] <- lapply(cor_df, function(x) {
+  if (is.numeric(x)) formatC(x, digits = 2, format = "f") else x
+})
+
+# Step 5: Create and export flextable for Word
+cor_flex <- flextable(cor_df) %>%
+  autofit() %>%
+  set_caption("Table 3. Correlation Matrix of Key Variables")
+
+read_docx() %>%
+  body_add_flextable(cor_flex) %>%
+  print(target = "Table3_Correlation_Matrix.docx")
+
+
+# =======================
+# 9. PANEL DATA + MODELS
+# =======================
+pdata <- pdata.frame(merged_clean, index = c("CountryCode", "Year"))
+
+model_fe <- plm(Log_MPI ~ RuleOfLaw + Log_GDP_Const2015 + Infl + Trade_GDP + Log_Population,
+                data = pdata, model = "within", effect = "twoways")
+model_re <- plm(Log_MPI ~ RuleOfLaw + Log_GDP_Const2015 + Infl + Trade_GDP + Log_Population,
+                data = pdata, model = "random", effect = "twoways")
+print(phtest(model_fe, model_re))  # Hausman test
+
+# Main models
+model_re_rul <- plm(Log_MPI ~ RuleOfLaw + Log_GDP_Const2015 + Infl + Trade_GDP + Log_Population,
+                    data = pdata, model = "random", effect = "twoways")
+model_re_gov <- plm(Log_MPI ~ GovEff + Log_GDP_Const2015 + Infl + Trade_GDP + Log_Population,
+                    data = pdata, model = "random", effect = "twoways")
+model_re_reg <- plm(Log_MPI ~ RegQuality + Log_GDP_Const2015 + Infl + Trade_GDP + Log_Population,
+                    data = pdata, model = "random", effect = "twoways")
+
+# Robustness models
+model_pca <- plm(Log_MPI ~ Gov_PCA1 + Log_GDP_Const2015 + Infl + Trade_GDP + Log_Population,
+                 data = pdata, model = "random", effect = "twoways")
+model_postcovid <- plm(Log_MPI ~ GovEff * Post_Covid + Log_GDP_Const2015 + Infl + Trade_GDP + Log_Population,
+                       data = pdata, model = "random", effect = "twoways")
+model_fdi <- plm(Log_FDI_Total ~ GovEff + Log_GDP_Const2015 + Infl + Trade_GDP + Log_Population,
+                 data = pdata, model = "random", effect = "twoways")
+
+# =======================
+# REGRESSION TABLES: STANDARD ERRORS + STARS
+# =======================
+
+
+# Table 4: Governance indicators
+modelsummary(
+  list(
+    "Rule of Law" = model_re_rul,
+    "Gov. Effectiveness" = model_re_gov,
+    "Reg. Quality" = model_re_reg
+  ),
+  stars = TRUE,                       
+  statistic = "std.error",            
+  output = "Table4_Governance_MPI.docx",
+  title = "Table 4. Baseline Regression Results: Governance and Mobilized Private Investment"
+)
+
+# Table 5: Robustness models
+modelsummary(
+  list(
+    "PCA Governance Index (MPI)" = model_pca,
+    "Post-COVID Interaction (MPI)" = model_postcovid,
+    "Gov. Effectiveness (FDI)" = model_fdi
+  ),
+  stars = TRUE,
+  statistic = "std.error",
+  output = "Table5_Robustness_Models.docx",
+  title = "Table 5. Extended Regression Models: Robustness Checks"
+)
+
+# =======================
+# APPENDIX A: Data Coverage + Total MPI per Country
+# =======================
+
+appendix_a <- merged_clean %>%
+  group_by(Country) %>%
+  summarise(
+    N_Years_Observed = n_distinct(Year),
+    Total_MPI_Real_2015_USD = sum(MPI_Real, na.rm = TRUE)
+  ) %>%
+  mutate(
+    Total_MPI_Real_2015_USD = formatC(Total_MPI_Real_2015_USD, format = "e", digits = 2)
+  )
+
+# Export to Word
+appendix_a_flex <- flextable(appendix_a) %>%
+  autofit() %>%
+  set_caption("Appendix A. Country Coverage and Total Mobilized Private Investment (2015 USD)")
+
+read_docx() %>%
+  body_add_flextable(appendix_a_flex) %>%
+  print(target = "Appendix_A_Country_MPI_Coverage.docx")
+
+# =======================
+# APPENDIX 1: Data Coverage + Total MPI per Country
+# =======================
+
+# Ensure country naming is unified
+merged_clean <- merged_clean %>%
+  rename(Country = Country.x)  # adjust if needed
+
+# Optional: disable scientific rounding that might hide small numbers
+options(scipen = 999)
+
+# Step 1: Filter out only rows where MPI_Real is non-NA
+# AND keep even small non-zero values accurately
+appendix_a <- merged_clean %>%
+  filter(!is.na(MPI_Real)) %>%
+  group_by(Country) %>%
+  summarise(
+    Years_Observed = n_distinct(Year),
+    Total_MPI_Real_2015_USD = sum(MPI_Real, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  # Prevent zero values from hiding small MPI amounts
+  mutate(
+    Total_MPI_Real_2015_USD = ifelse(
+      Total_MPI_Real_2015_USD > 0,
+      formatC(Total_MPI_Real_2015_USD, format = "e", digits = 2),
+      "No observed MPI"
+    )
+  ) %>%
+  arrange(stri_sort(Country, locale = "en"))
+
+# Step 2: Create flextable for Word export
+appendix_a_flex <- flextable(appendix_a) %>%
+  autofit() %>%
+  set_caption("Appendix 1. Country-Year Coverage and Total Mobilized Private Investment (2015 USD)")
+
+# Step 3: Export to Word
+read_docx() %>%
+  body_add_flextable(appendix_a_flex) %>%
+  print(target = "Appendix_1_Country_MPI_Coverage.docx")
+
+# =======================
+# Appendix 2 – Hausman Test
+# =======================
+
+# Assuming model_fe and model_re are defined
+hausman_result <- phtest(model_fe, model_re)
+
+# View in R
+print(hausman_result)
+
+# Optional: Create formatted summary for Word export
+hausman_table <- data.frame(
+  Statistic = "Hausman Test (FE vs RE)",
+  Chi_Squared = round(hausman_result$statistic, 2),
+  df = hausman_result$parameter,
+  p_value = round(hausman_result$p.value, 4),
+  Decision = ifelse(hausman_result$p.value > 0.05, "Random Effects preferred", "Fixed Effects preferred")
+)
+
+
+hausman_flex <- flextable(hausman_table) %>%
+  autofit() %>%
+  set_caption("Appendix 2. Hausman Test: Fixed vs Random Effects")
+
+read_docx() %>%
+  body_add_flextable(hausman_flex) %>%
+  print(target = "Appendix_2_Hausman_Test.docx")
+
+# =======================
+# Appendix 3 – Full Governance Models – All Six WGI Indicators
+# =======================
+
+# List of WGI indicators
+wgi_vars <- c("Corruption", "GovEff", "Stability", "RuleOfLaw", "RegQuality", "Voice")
+
+# Fit models for each WGI indicator
+wgi_models <- lapply(wgi_vars, function(var) {
+  formula <- as.formula(paste("Log_MPI ~", var, "+ Log_GDP_Const2015 + Infl + Trade_GDP + Log_Population"))
+  plm(formula, data = pdata, model = "random", effect = "twoways")
+})
+
+# Name models by indicator
+names(wgi_models) <- c("Corruption", "Gov. Effectiveness", "Political Stability",
+                       "Rule of Law", "Reg. Quality", "Voice & Accountability")
+
+# Export to Word
+modelsummary(
+  wgi_models,
+  output = "Appendix_3_Full_WGI_Models.docx",
+  title = "Appendix 3. Random Effects Models for All WGI Governance Dimensions",
+  stars = TRUE,
+  statistic = "std.error",
+  gof_omit = "IC|Log.Lik|Std.Errors"
+)
+
+
+# =======================
+# Appendix 4 – PCA Governance Index Diagnostics
+# =======================
+
+
+# Run PCA again if needed
+gov_data <- merged_clean %>%
+  select(Corruption, GovEff, Stability, RuleOfLaw, RegQuality, Voice) %>%
+  na.omit()
+
+gov_scaled <- scale(gov_data)
+gov_pca <- prcomp(gov_scaled, center = TRUE, scale. = TRUE)
+
+# Scree plot
+png("Appendix4_PCA_Scree_Plot.png", width = 800, height = 600)
+plot(gov_pca, type = "l", main = "Appendix 4A. Scree Plot: PCA of Governance Indicators")
+dev.off()
+
+# Component loadings table
+pca_loadings <- as.data.frame(gov_pca$rotation[, 1, drop = FALSE])
+colnames(pca_loadings) <- "PC1 (Gov_PCA1)"
+pca_loadings$Indicator <- rownames(pca_loadings)
+pca_loadings <- pca_loadings[, c("Indicator", "PC1 (Gov_PCA1)")]
+
+# Export loadings table
+library(flextable)
+pca_flex <- flextable(pca_loadings) %>%
+  autofit() %>%
+  set_caption("Appendix 4B. PCA Loadings for Governance Indicators (Gov_PCA1)")
+
+read_docx() %>%
+  body_add_par("Appendix 4. PCA Governance Index Diagnostics", style = "heading 1") %>%
+  body_add_par("Part A: Scree Plot of Principal Components") %>%
+  body_add_img(src = "Appendix4_PCA_Scree_Plot.png", width = 6, height = 4) %>%
+  body_add_par("Part B: Loadings for First Principal Component") %>%
+  body_add_flextable(pca_flex) %>%
+  print(target = "Appendix_4_PCA_Governance_Index.docx")
+
+# =======================
+# Appendix 6 – WGI Heatmap
+# =======================
+
+# Step 1: Filter data for 2023 and select governance indicator
+gov_map_data <- merged_clean %>%
+  filter(Year == 2023) %>%
+  select(CountryCode, Country, RuleOfLaw)  # Replace with GovEff or RegQuality as needed
+
+# Step 2: Get world map with ISO codes
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Step 3: Join governance data to map
+world_gov <- left_join(world, gov_map_data, by = c("iso_a3" = "CountryCode"))
+
+# Step 4: Plot heatmap
+heatmap_plot <- ggplot(data = world_gov) +
+  geom_sf(aes(fill = RuleOfLaw), color = "white", size = 0.1) +
+  scale_fill_gradient2(
+    low = "firebrick3", high = "steelblue", mid = "white",
+    midpoint = 0, na.value = "grey90",
+    name = "Rule of Law\n(WGI, 2023)"
+  ) +
+  labs(
+    title = "Appendix 6. Global Heatmap of Rule of Law (2023)",
+    caption = "Source: Worldwide Governance Indicators (WGI)"
+  ) +
+  theme_minimal(base_size = 11)
+
+
+# Save to PNG file
+ggsave("Appendix6_Governance_Heatmap_2023.png", plot = heatmap_plot,
+       width = 10, height = 6, dpi = 300)
+
+# Export to Word
+read_docx() %>%
+  body_add_par("Appendix 6. Heatmap of Rule of Law (2023)", style = "heading 1") %>%
+  body_add_par("This map displays WGI Rule of Law scores by country for the year 2023.") %>%
+  body_add_img("Appendix6_Governance_Heatmap_2023.png", width = 6.5, height = 4.5) %>%
+  print(target = "Appendix_6_Heatmap_Governance_2023.docx")
+
+# =======================
+# Appendix 7 – MPI Heatmap
+# =======================
+
+# Step 1: Aggregate total MPI by country (absolute, 2012–2023)
+mpi_map_data <- merged_clean %>%
+  group_by(CountryCode, Country) %>%
+  summarise(Total_MPI = sum(MPI_Real, na.rm = TRUE)) %>%
+  ungroup()
+
+# Step 2: Join with world map
+world <- ne_countries(scale = "medium", returnclass = "sf")
+world_mpi <- left_join(world, mpi_map_data, by = c("iso_a3" = "CountryCode"))
+
+# Step 3: Create heatmap (no log, green scale)
+mpi_heatmap <- ggplot(data = world_mpi) +
+  geom_sf(aes(fill = Total_MPI), color = "white", size = 0.1) +
+  scale_fill_gradient(
+    low = "#e5f5e0", high = "#006d2c",
+    na.value = "grey90",
+    name = "Total MPI\n(2012–2023 USD)"
+  ) +
+  labs(
+    title = "Appendix 7. Heatmap of Total Mobilized Private Investment (2012–2023)",
+    caption = "Source: OECD Mobilization Database"
+  ) +
+  theme_minimal(base_size = 11)
+
+# Step 4: Save to PNG
+ggsave("Appendix7_MPI_Total_Heatmap.png", plot = mpi_heatmap, width = 10, height = 6, dpi = 300)
+
+# Step 5: Export to Word appendix
+read_docx() %>%
+  body_add_par("Appendix 7. Heatmap of Total Mobilized Private Investment (2012–2023)", style = "heading 1") %>%
+  body_add_par("This map displays the total value of mobilized private investment per country from 2012 to 2023 in constant 2015 USD. Darker green reflects higher investment totals.") %>%
+  body_add_img("Appendix7_MPI_Total_Heatmap.png", width = 6.5, height = 4.5) %>%
+  print(target = "Appendix_7_MPI_Total_Heatmap.docx")
